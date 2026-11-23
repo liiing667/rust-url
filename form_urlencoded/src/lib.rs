@@ -25,6 +25,7 @@ compile_error!("the `alloc` feature must currently be enabled");
 
 use alloc::borrow::{Borrow, Cow, ToOwned};
 use alloc::string::String;
+use alloc::vec::Vec;
 use core::str;
 use percent_encoding::{percent_decode, percent_encode_byte};
 
@@ -39,6 +40,44 @@ use percent_encoding::{percent_decode, percent_encode_byte};
 pub fn parse(input: &[u8]) -> Parse<'_> {
     Parse { input }
 }
+
+/// Parse a form body that has been split into several chunks.
+///
+/// This is a convenience wrapper around [`Parser`] for callers that already
+/// hold every chunk: it feeds them to a [`Parser`] in order and returns the
+/// complete, decoded multi-value field set. Chunk boundaries may fall inside
+/// a pair, a `+` or a percent-encoded sequence without affecting the result;
+/// see [`Parser`] for details.
+///
+/// The decoded names and values are always owned because a single pair can be
+/// spread over more than one chunk.
+///
+/// # Examples
+///
+/// ```
+/// use form_urlencoded::parse_chunks;
+///
+/// let pairs = parse_chunks([&b"foo=1&fo"[..], b"o=2&bar=", b"baz"]);
+/// assert_eq!(pairs, vec![
+///     ("foo".to_owned(), "1".to_owned()),
+///     ("foo".to_owned(), "2".to_owned()),
+///     ("bar".to_owned(), "baz".to_owned()),
+/// ]);
+/// ```
+pub fn parse_chunks<I, C>(chunks: I) -> Vec<(String, String)>
+where
+    I: IntoIterator<Item = C>,
+    C: AsRef<[u8]>,
+{
+    let mut parser = Parser::new();
+    let mut pairs = Vec::new();
+    for chunk in chunks {
+        pairs.extend(parser.parse_next(chunk.as_ref()));
+    }
+    pairs.extend(parser.finish());
+    pairs
+}
+
 /// The return type of `parse()`.
 #[derive(Copy, Clone)]
 pub struct Parse<'a> {
@@ -73,6 +112,128 @@ fn decode(input: &[u8]) -> Cow<'_, str> {
         Cow::Owned(vec) => Cow::Owned(vec),
         Cow::Borrowed(_) => replaced,
     })
+}
+
+/// A parser for the `application/x-www-form-urlencoded` syntax that can be
+/// fed one chunk of bytes at a time.
+///
+/// When a form is submitted with an `application/x-www-form-urlencoded`
+/// body, consumers such as HTTP servers often receive the body in several
+/// reads rather than as a single byte string. Splitting the body into chunks
+/// at arbitrary boundaries must not change which name/value pairs are parsed:
+///
+/// * a pair can span chunk boundaries (for example `foo=b` in one chunk and
+///   `ar` in the next),
+/// * a `+` that represents a space can end up in any chunk,
+/// * a percent-encoded sequence (`%XX`) can be split across chunks (including
+///   the multibyte UTF-8 encoding of a single character),
+/// * a pair with an empty value (`foo=`) and repeated names
+///   (`foo=1&foo=2`) must be preserved exactly.
+///
+/// This type keeps the state needed to join the chunks back together before
+/// decoding, so the pairs produced from a body split into many chunks are
+/// identical to those produced by feeding the whole body to [`parse`].
+///
+/// Unlike [`Parse`], the decoded names and values are always owned: the input
+/// bytes may be split across chunks, so borrowing from a single chunk is not
+/// generally possible.
+///
+/// # Examples
+///
+/// ```
+/// use form_urlencoded::Parser;
+///
+/// // The body `foo=bar+baz&foo=%E2%9C%93&empty=` split at awkward boundaries.
+/// let chunks: &[&[u8]] = &[
+///     b"foo=bar+ba",
+///     b"z&foo=%E2",
+///     b"%9C%93&empt",
+///     b"y=",
+/// ];
+///
+/// let mut parser = Parser::new();
+/// let mut pairs = Vec::new();
+/// for chunk in chunks {
+///     pairs.extend(parser.parse_next(chunk).map(|(k, v)| (k, v)));
+/// }
+/// pairs.extend(parser.finish());
+///
+/// assert_eq!(pairs, vec![
+///     ("foo".to_owned(), "bar baz".to_owned()),
+///     ("foo".to_owned(), "✓".to_owned()),
+///     ("empty".to_owned(), String::new()),
+/// ]);
+/// ```
+#[derive(Clone, Debug, Default)]
+pub struct Parser {
+    /// Bytes of the current (not yet terminated by `&`) name/value pair.
+    ///
+    /// The pair is kept in its raw, still-encoded form so that `+` and
+    /// percent-encoded sequences split across chunk boundaries can be
+    /// reassembled before decoding.
+    pending: Vec<u8>,
+}
+
+impl Parser {
+    /// Create a new empty parser.
+    pub fn new() -> Self {
+        Parser {
+            pending: Vec::new(),
+        }
+    }
+
+    /// Feed a chunk of the form body and return every complete name/value
+    /// pair found inside it.
+    ///
+    /// The chunk may start or end in the middle of a pair, a `+` or a
+    /// percent-encoded sequence. Any bytes after the last `&` are buffered
+    /// and combined with later chunks. Empty sequences (consecutive `&`
+    /// separators, including a leading one) are ignored, matching [`parse`].
+    pub fn parse_next(&mut self, chunk: &[u8]) -> Vec<(String, String)> {
+        let mut pairs = Vec::new();
+        // Keep the raw, still-encoded bytes of the current pair in `pending`.
+        // Only `&` is treated as a boundary here, so a `+` or a percent-encoded
+        // sequence split across chunk boundaries is transparently reassembled
+        // before decoding.
+        self.pending.extend_from_slice(chunk);
+
+        let mut remaining = self.pending.as_slice();
+        while let Some(index) = remaining.iter().position(|&b| b == b'&') {
+            let sequence = &remaining[..index];
+            remaining = &remaining[index + 1..];
+            if !sequence.is_empty() {
+                pairs.push(decode_pair(sequence));
+            }
+        }
+
+        // Keep only the bytes after the last separator for the next chunk.
+        let leftover = remaining.len();
+        self.pending.drain(..self.pending.len() - leftover);
+        pairs
+    }
+
+    /// Signal that no more chunks are coming and return the final
+    /// name/value pair, if any bytes are still buffered.
+    ///
+    /// A trailing `&` does not produce an empty pair, so this returns an
+    /// empty vector when the body (or its last chunk) ends with `&`.
+    pub fn finish(&mut self) -> Vec<(String, String)> {
+        let mut pairs = Vec::new();
+        if !self.pending.is_empty() {
+            pairs.push(decode_pair(&self.pending));
+            self.pending.clear();
+        }
+        pairs
+    }
+}
+
+/// Split a single `name=value` sequence (without any `&`) into a decoded pair.
+fn decode_pair(sequence: &[u8]) -> (String, String) {
+    let (name, value) = match sequence.iter().position(|&b| b == b'=') {
+        Some(index) => (&sequence[..index], &sequence[index + 1..]),
+        None => (sequence, &[][..]),
+    };
+    (decode(name).into_owned(), decode(value).into_owned())
 }
 
 /// Replace b'+' with b' '

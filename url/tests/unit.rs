@@ -471,6 +471,44 @@ fn form_urlencoded_encoding_override() {
 }
 
 #[test]
+fn form_urlencoded_chunked_matches_query_pairs() {
+    use form_urlencoded::Parser;
+
+    // A login form with a repeated field, a plus, a percent-encoded
+    // multibyte character and an empty value.
+    let body = "user=alice&token=abc+def&token=%E2%9C%93&remember=";
+
+    // The authorization view derived from `Url::query_pairs` for the whole
+    // body is the reference multi-value field set.
+    let url = Url::parse(&format!("https://example.com/login?{body}")).unwrap();
+    let reference: Vec<(String, String)> = url
+        .query_pairs()
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect();
+
+    // Split the same form at every possible chunk boundary and make sure the
+    // chunked parser always reproduces the reference view.
+    let bytes = body.as_bytes();
+    for split in 0..=bytes.len() {
+        let mut parser = Parser::new();
+        let mut pairs = parser.parse_next(&bytes[..split]);
+        pairs.extend(parser.parse_next(&bytes[split..]));
+        pairs.extend(parser.finish());
+        assert_eq!(pairs, reference, "split at byte {split}");
+    }
+
+    assert_eq!(
+        reference,
+        vec![
+            ("user".to_owned(), "alice".to_owned()),
+            ("token".to_owned(), "abc def".to_owned()),
+            ("token".to_owned(), "✓".to_owned()),
+            ("remember".to_owned(), String::new()),
+        ],
+    );
+}
+
+#[test]
 /// https://github.com/servo/rust-url/issues/61
 fn issue_61() {
     let mut url = Url::parse("http://mozilla.org").unwrap();

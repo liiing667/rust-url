@@ -228,5 +228,20 @@
    [88]],
   ["data:;CHARSET=\"X\",X",
    "text/plain;charset=X",
-   [88]]
+   [88]],
+  ["data:text/plain;a=\";base64,\"WA",
+   "text/plain;a=\";base64\"",
+   [34, 87, 65]],
+  ["data:text/plain;a=\";base64\",WA",
+   "text/plain;a=\";base64\"",
+   [87, 65]],
+  ["data:text/plain;a=\";base64\";b=1,WA",
+   "text/plain;a=\";base64\";b=1",
+   [87, 65]],
+  ["data:text/plain;a=\";base64\";base64,WA",
+   "text/plain;a=\";base64\"",
+   [88]],
+  ["data:text/plain;charset=UTF-8;charset=US-ASCII,hi",
+   "text/plain;charset=UTF-8",
+   [104, 105]]
 ]

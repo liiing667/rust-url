@@ -240,28 +240,76 @@ fn parse_header(from_colon_to_comma: &str) -> (mime::Mime, bool) {
     (mime_type, base64)
 }
 
-/// None: no base64 suffix
-#[allow(clippy::skip_while_next)]
+/// Split off the `;base64` marker described by
+/// <https://fetch.spec.whatwg.org/#data-url-processor> if present,
+/// returning the header without that final segment.
+///
+/// The marker must be a *separate* semicolon-delimited segment of the
+/// header. A semicolon that occurs inside a quoted MIME parameter value is
+/// part of that value and so is never the start of the marker:
+///
+/// ```text
+/// data:text/plain;a=";base64,WA
+/// ```
+///
+/// Here `;base64` is the content of the `a` parameter: the URL is **not**
+/// base64-encoded and its body is the literal bytes `"WA`. Scanning the raw
+/// header backwards (as a previous implementation did) cannot tell the two
+/// cases apart and would decode the body as base64 while reporting a
+/// `text/plain` MIME type, making the decoded content disagree with the type
+/// advertised to consumers. We therefore make a single forward pass that
+/// tracks quoted-string state, so the MIME type, the base64 flag and the
+/// body decoding mode all describe the same parsed header.
+///
+/// `None` means there is no base64 suffix.
 fn remove_base64_suffix(s: &str) -> Option<&str> {
-    let mut bytes = s.bytes();
-    {
-        // Ignore ASCII tabs or newlines like the URL parser would
-        let iter = bytes
-            .by_ref()
-            .filter(|&byte| !matches!(byte, b'\t' | b'\n' | b'\r'));
-
-        // Search from the end
-        let mut iter = iter.rev();
-
-        require!(iter.next()? == b'4');
-        require!(iter.next()? == b'6');
-        require!(iter.next()?.eq_ignore_ascii_case(&b'e'));
-        require!(iter.next()?.eq_ignore_ascii_case(&b's'));
-        require!(iter.next()?.eq_ignore_ascii_case(&b'a'));
-        require!(iter.next()?.eq_ignore_ascii_case(&b'b'));
-        require!(iter.skip_while(|&byte| byte == b' ').next()? == b';');
+    // Index (in the original string) of the last semicolon that is not
+    // inside a quoted parameter value, ignoring ASCII tabs and newlines like
+    // the URL parser would.
+    let mut last_semicolon = None;
+    let mut in_quotes = false;
+    let mut skip_next = false;
+    for (index, byte) in s.bytes().enumerate() {
+        if matches!(byte, b'\t' | b'\n' | b'\r') {
+            continue;
+        }
+        if skip_next {
+            // A byte escaped by a backslash inside a quoted string cannot
+            // open or close the quote, nor start a new segment.
+            skip_next = false;
+            continue;
+        }
+        match byte {
+            b'\\' if in_quotes => skip_next = true,
+            b'"' => in_quotes = !in_quotes,
+            b';' if !in_quotes => last_semicolon = Some(index),
+            _ => {}
+        }
     }
-    Some(&s[..bytes.len()])
+
+    let semicolon_index = last_semicolon?;
+
+    // The segment after the last unquoted semicolon has to be exactly the
+    // ASCII case-insensitive token `base64`. Tabs and newlines would have
+    // been removed by the URL parser before this stage, so we ignore them
+    // here too. Spaces are the only HTTP whitespace still present and are
+    // allowed *around* the token but never inside it, which is why the
+    // segment `base 64` does not match.
+    let mut token = s[semicolon_index + 1..]
+        .bytes()
+        .filter(|&byte| !matches!(byte, b'\t' | b'\n' | b'\r'))
+        .skip_while(|&byte| byte == b' ');
+    for &expected in b"base64" {
+        let byte = match token.next() {
+            Some(byte) => byte,
+            None => return None,
+        };
+        require!(byte.eq_ignore_ascii_case(&expected));
+    }
+    // Only trailing spaces may follow the six-byte token.
+    require!(token.all(|byte| byte == b' '));
+
+    Some(&s[..semicolon_index])
 }
 
 fn percent_encode(byte: u8, string: &mut String) {
@@ -344,4 +392,138 @@ where
     let fragment = decode_without_base64(encoded_body_plus_fragment, |bytes| decoder.feed(bytes))?;
     decoder.finish()?;
     Ok(fragment)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{remove_base64_suffix, DataUrl};
+
+    #[test]
+    fn base64_suffix_detection() {
+        // Real markers: separate, unquoted `;base64` segments.
+        assert!(remove_base64_suffix(";base64").is_some());
+        assert!(remove_base64_suffix("; base64").is_some());
+        assert!(remove_base64_suffix(";  base64  ").is_some());
+        assert!(remove_base64_suffix(";BASe64").is_some());
+        assert!(remove_base64_suffix(";base64;base64").is_some());
+        assert!(remove_base64_suffix("text/plain;base64").is_some());
+        assert!(remove_base64_suffix("text/plain;base64;base64").is_some());
+
+        // Not markers: wrong token, extra segment, or percent-encoded.
+        assert!(remove_base64_suffix(";base64x").is_none());
+        assert!(remove_base64_suffix(";base 64").is_none());
+        assert!(remove_base64_suffix(";base64;").is_none());
+        assert!(remove_base64_suffix(";base64=x").is_none());
+        assert!(remove_base64_suffix(";%62ase64").is_none());
+        assert!(remove_base64_suffix("%3Bbase64").is_none());
+        assert!(remove_base64_suffix("text/plain").is_none());
+
+        // A `;base64` sequence inside a quoted parameter value is part of
+        // the value and must never be treated as the encoding marker.
+        assert!(remove_base64_suffix("text/plain;a=\";base64\"").is_none());
+        assert!(remove_base64_suffix("text/plain;a=\";base64\";b=1").is_none());
+        assert!(remove_base64_suffix("a=\";base64\"").is_none());
+        // An escaped quote does not close the quoted string, so the marker
+        // after it is still recognized.
+        assert!(remove_base64_suffix("a=\"\\\" ;base64\";base64").is_some());
+        // A backslash only escapes inside a quoted string.
+        assert!(remove_base64_suffix("a=\\;base64").is_some());
+    }
+
+    #[test]
+    fn quoted_parameter_with_pseudo_base64_marker_is_not_base64() {
+        // The `;base64` text lives inside the quoted value of parameter `a`.
+        // The body must therefore be returned verbatim and the MIME type must
+        // describe a text/plain resource, instead of being base64-decoded.
+        let url = DataUrl::process("data:text/plain;a=\";base64,\"WA").unwrap();
+        let (body, _fragment) = url.decode_to_vec().unwrap();
+        assert_eq!(url.mime_type().to_string(), "text/plain;a=\";base64\"");
+        assert_eq!(body, b"\"WA");
+
+        let url = DataUrl::process("data:text/plain;a=\";base64\",WA").unwrap();
+        let (body, _fragment) = url.decode_to_vec().unwrap();
+        assert_eq!(url.mime_type().to_string(), "text/plain;a=\";base64\"");
+        assert_eq!(body, b"WA");
+
+        let url = DataUrl::process("data:text/plain;a=\";base64\";b=1,WA").unwrap();
+        let (body, _fragment) = url.decode_to_vec().unwrap();
+        assert_eq!(
+            url.mime_type().to_string(),
+            "text/plain;a=\";base64\";b=1"
+        );
+        assert_eq!(body, b"WA");
+    }
+
+    #[test]
+    fn real_base64_marker_still_decodes_body() {
+        for input in [
+            "data:;base64,WA",
+            "data:; base64,WA",
+            "data:;BASe64,WA",
+            "data:;base64;base64,WA",
+            "data:  ;charset=x   ;  base64,WA",
+            "data:text/plain;a=\";base64\";base64,WA",
+        ] {
+            let url = DataUrl::process(input).unwrap();
+            let (body, _fragment) = url.decode_to_vec().unwrap();
+            assert_eq!(body, b"X", "input {input:?} must be base64-decoded");
+        }
+    }
+
+    #[test]
+    fn duplicate_parameters_keep_first_value() {
+        let url = DataUrl::process("data:text/plain;charset=UTF-8;charset=US-ASCII,hi").unwrap();
+        let (body, _fragment) = url.decode_to_vec().unwrap();
+        assert_eq!(url.mime_type().to_string(), "text/plain;charset=UTF-8");
+        assert_eq!(body, b"hi");
+    }
+
+    #[test]
+    fn empty_or_invalid_type_uses_default_mime() {
+        for input in ["data:/plain,X", "data: ,X", "data:X,X", "data:text / html,X"] {
+            let url = DataUrl::process(input).unwrap();
+            let (body, _fragment) = url.decode_to_vec().unwrap();
+            assert_eq!(
+                url.mime_type().to_string(),
+                "text/plain;charset=US-ASCII",
+                "input {input:?}"
+            );
+            assert_eq!(body, b"X");
+        }
+    }
+
+    #[test]
+    fn empty_bodies_keep_working() {
+        let url = DataUrl::process("data:,").unwrap();
+        let (body, _fragment) = url.decode_to_vec().unwrap();
+        assert_eq!(url.mime_type().to_string(), "text/plain;charset=US-ASCII");
+        assert!(body.is_empty());
+
+        let url = DataUrl::process("data:;base64,").unwrap();
+        let (body, _fragment) = url.decode_to_vec().unwrap();
+        assert_eq!(url.mime_type().to_string(), "text/plain;charset=US-ASCII");
+        assert!(body.is_empty());
+    }
+
+    #[test]
+    fn mime_type_and_decoding_mode_always_agree() {
+        // For every spelling, compare the declared type against the actual
+        // content produced by the consumer-facing decoder.
+        let cases: &[(&str, &str, &[u8])] = &[
+            ("data:text/plain,a", "text/plain", b"a"),
+            ("data:;base64,YQ==", "text/plain;charset=US-ASCII", b"a"),
+            (
+                "data:text/plain;a=\";base64,YQ==",
+                "text/plain;a=\";base64\"",
+                b"YQ==",
+            ),
+            ("data:text/plain;base64,YQ==", "text/plain", b"a"),
+        ];
+        for (input, expected_mime, expected_body) in cases {
+            let url = DataUrl::process(input).unwrap();
+            let (body, _fragment) = url.decode_to_vec().unwrap();
+            assert_eq!(url.mime_type().to_string(), *expected_mime);
+            assert_eq!(body, *expected_body);
+        }
+    }
 }

@@ -26,11 +26,16 @@ pub fn url_origin(url: &Url) -> Origin {
                 _ => Origin::new_opaque(),
             }
         }
-        "ftp" | "http" | "https" | "ws" | "wss" => Origin::Tuple(
-            scheme.to_owned(),
-            url.host().unwrap().to_owned(),
-            url.port_or_known_default().unwrap(),
-        ),
+        "ftp" | "http" | "https" | "ws" | "wss" => {
+            match (url.host(), url.port_or_known_default()) {
+                (Some(host), Some(port)) => {
+                    Origin::Tuple(scheme.to_owned(), host.to_owned(), port)
+                }
+                // A special URL without a usable host/port is not a trustworthy
+                // tuple origin. Fail closed rather than reusing a stale component.
+                _ => Origin::new_opaque(),
+            }
+        }
         // TODO: Figure out what to do if the scheme is a file
         "file" => Origin::new_opaque(),
         _ => Origin::new_opaque(),

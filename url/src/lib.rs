@@ -804,6 +804,27 @@ impl Url {
         assert_eq!(self.path_start, other.path_start);
         assert_eq!(self.query_start, other.query_start);
         assert_eq!(self.fragment_start, other.fragment_start);
+
+        // Origin derivation must observe the same generation as the serialized
+        // URL. In particular, a mutation may not leave a stale host or port
+        // behind for a later origin consumer to interpret as the current site.
+        match (self.origin(), other.origin()) {
+            (
+                Origin::Tuple(ref scheme, ref host, port),
+                Origin::Tuple(ref scheme2, ref host2, port2),
+            ) => {
+                assert_eq!(scheme, scheme2);
+                assert_eq!(host, host2);
+                assert_eq!(port, port2);
+            }
+            (Origin::Opaque(_), Origin::Opaque(_)) => {}
+            _ => {
+                return Err(format!(
+                    "origin kind mismatch for URL {:?}",
+                    self.serialization
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -1938,7 +1959,8 @@ impl Url {
     /// Change this URL’s host.
     ///
     /// Removing the host (calling this with `None`)
-    /// will also remove any username, password, and port number.
+    /// will also remove any username, password, and port number, and clears the
+    /// host identity observed by `host`, `host_str`, and origin consumers.
     ///
     /// # Examples
     ///
@@ -2070,6 +2092,7 @@ impl Url {
             self.username_end = new_path_start;
             self.host_start = new_path_start;
             self.host_end = new_path_start;
+            self.host = HostInternal::None;
             self.port = None;
             if let Some(ref mut index) = self.query_start {
                 *index -= offset

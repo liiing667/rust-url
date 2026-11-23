@@ -563,6 +563,107 @@ fn test_set_host() {
 }
 
 #[test]
+fn removing_host_clears_origin_identity() {
+    let mut url = Url::parse("foo://alice:secret@[::1]:8080/path").unwrap();
+    url.check_invariants().unwrap();
+
+    url.set_host(None).unwrap();
+    assert_eq!(url.as_str(), "foo:/path");
+    assert!(!url.has_host());
+    assert_eq!(url.host(), None);
+    assert_eq!(url.host_str(), None);
+    assert_eq!(url.username(), "");
+    assert_eq!(url.password(), None);
+    assert_eq!(url.port(), None);
+    assert!(!url.origin().is_tuple());
+    url.check_invariants().unwrap();
+
+    // A removed host must not keep accepting port, password or username
+    // mutations through the old host identity.
+    for _ in 0..2 {
+        assert!(url.set_port(Some(8080)).is_err());
+        assert!(url.set_password(Some("secret")).is_err());
+        assert!(url.set_username("alice").is_err());
+        assert_eq!(url.as_str(), "foo:/path");
+        assert_eq!(url.host(), None);
+        url.check_invariants().unwrap();
+    }
+
+    // Retrying with a complete candidate host must publish a new generation.
+    url.set_host(Some("example.com")).unwrap();
+    assert_eq!(url.as_str(), "foo://example.com/path");
+    assert_eq!(url.host_str(), Some("example.com"));
+    url.set_username("alice").unwrap();
+    assert_eq!(url.as_str(), "foo://alice@example.com/path");
+    url.check_invariants().unwrap();
+}
+
+#[test]
+fn file_host_removal_clears_host_consumer() {
+    let mut url = Url::parse("file://127.0.0.1/path").unwrap();
+    assert_eq!(url.host_str(), Some("127.0.0.1"));
+
+    url.set_host(None).unwrap();
+    assert_eq!(url.as_str(), "file:///path");
+    assert!(!url.has_host());
+    assert_eq!(url.host(), None);
+    assert_eq!(url.host_str(), None);
+    assert!(!url.origin().is_tuple());
+    url.check_invariants().unwrap();
+}
+
+#[test]
+fn alternating_mutations_read_origin_from_latest_generation() {
+    let mut url = Url::parse("http://first.example/path").unwrap();
+    assert_eq!(url.origin().ascii_serialization(), "http://first.example");
+
+    url.set_host(Some("second.example")).unwrap();
+    assert_eq!(url.origin().ascii_serialization(), "http://second.example");
+
+    url.set_port(Some(8080)).unwrap();
+    assert_eq!(
+        url.origin().ascii_serialization(),
+        "http://second.example:8080"
+    );
+
+    // Userinfo is not part of a tuple origin.
+    url.set_username("alice").unwrap();
+    url.set_password(Some("secret")).unwrap();
+    assert_eq!(
+        url.origin().ascii_serialization(),
+        "http://second.example:8080"
+    );
+
+    // A rejected host change must not publish a partially updated URL.
+    let before_rejection = url.clone();
+    assert!(url.set_host(Some("")).is_err());
+    assert_eq!(url, before_rejection);
+    assert_eq!(
+        url.origin().ascii_serialization(),
+        "http://second.example:8080"
+    );
+    url.check_invariants().unwrap();
+
+    let before_rejected_removal = url.clone();
+    assert!(url.set_host(None).is_err());
+    assert_eq!(url, before_rejected_removal);
+    assert_eq!(
+        url.origin().ascii_serialization(),
+        "http://second.example:8080"
+    );
+
+    // The retry commits one complete new generation.
+    url.set_host(Some("third.example")).unwrap();
+    url.set_port(None).unwrap();
+    assert_eq!(url.origin().ascii_serialization(), "http://third.example");
+    assert_eq!(
+        Url::parse(url.as_str()).unwrap().origin(),
+        url.origin()
+    );
+    url.check_invariants().unwrap();
+}
+
+#[test]
 // https://github.com/servo/rust-url/issues/166
 fn test_leading_dots() {
     assert_eq!(

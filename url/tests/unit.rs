@@ -1438,3 +1438,222 @@ fn issue_1155() {
     let url = Url::parse("http://a:b@c:2\\9/").unwrap();
     assert_eq!(url.as_str(), "http://a:b@c:2/9/");
 }
+
+#[cfg(feature = "serde")]
+#[test]
+fn test_serde_internal_roundtrip_preserves_identity() {
+    use serde_derive::{Deserialize, Serialize};
+
+    // A record type whose `Url` is (de)serialized through the internal
+    // representation, the same way downstream policy consumers do.
+    #[derive(Debug, PartialEq, Serialize, Deserialize)]
+    struct Record {
+        #[serde(
+            serialize_with = "Url::serialize_internal",
+            deserialize_with = "Url::deserialize_internal"
+        )]
+        url: Url,
+    }
+
+    let inputs = [
+        "http://user:password@example.com:8080/some/path?x=1#frag",
+        "https://user@example.com/",
+        "http://example.com:80/",
+        "ftp://anonymous@127.0.0.1:21/resource",
+        "blob:http://example.net/uuid",
+        "file:///tmp/foo",
+        "mailto:test@example.net",
+        "https://[2001:db8::1]:8443/a/b?c=d&e=f#section",
+    ];
+
+    for input in inputs {
+        let original = Record {
+            url: Url::parse(input).unwrap(),
+        };
+
+        let json = serde_json::to_string(&original).unwrap();
+        let restored: Record = serde_json::from_str(&json).unwrap();
+
+        // The canonical object must be identical after the round trip...
+        assert_eq!(restored, original, "round trip changed {input:?}");
+        assert_eq!(restored.url, original.url);
+        // ... which means origin, credentials and every policy-relevant component
+        // stay in the same trust domain for every consumer. Compare the ASCII
+        // serialization because each call creates a fresh opaque origin.
+        assert_eq!(
+            restored.url.origin().ascii_serialization(),
+            original.url.origin().ascii_serialization()
+        );
+        assert_eq!(restored.url.username(), original.url.username());
+        assert_eq!(restored.url.password(), original.url.password());
+        assert_eq!(restored.url.host_str(), original.url.host_str());
+        assert_eq!(restored.url.port(), original.url.port());
+        restored.url.check_invariants().unwrap();
+    }
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn test_serde_internal_roundtrip_multiple_records_compare_origins() {
+    use serde_derive::{Deserialize, Serialize};
+
+    #[derive(Debug, PartialEq, Serialize, Deserialize)]
+    struct Record {
+        id: u32,
+        #[serde(
+            serialize_with = "Url::serialize_internal",
+            deserialize_with = "Url::deserialize_internal"
+        )]
+        url: Url,
+    }
+
+    let records = [
+        Record {
+            id: 1,
+            url: Url::parse("https://user:pw@trust.example:8443/a?b=c#d").unwrap(),
+        },
+        Record {
+            id: 2,
+            url: Url::parse("http://other.example/").unwrap(),
+        },
+        Record {
+            id: 3,
+            url: Url::parse("https://trust.example:8443/").unwrap(),
+        },
+    ];
+
+    let json = serde_json::to_string(&records).unwrap();
+    let restored: Vec<Record> = serde_json::from_str(&json).unwrap();
+
+    assert_eq!(restored.len(), records.len());
+    for (before, after) in records.iter().zip(restored.iter()) {
+        assert_eq!(before, after);
+        // Credentials must not leak across trust boundaries after a round trip.
+        assert_eq!(
+            after.url.origin().ascii_serialization(),
+            before.url.origin().ascii_serialization()
+        );
+        assert_eq!(after.url.username(), before.url.username());
+        assert_eq!(after.url.password(), before.url.password());
+    }
+
+    // Same-origin relation is preserved record by record: record 1 and 3 share
+    // an origin even though 1 carries credentials and a path.
+    assert_eq!(
+        restored[0].url.origin().ascii_serialization(),
+        restored[2].url.origin().ascii_serialization()
+    );
+    assert_ne!(
+        restored[0].url.origin().ascii_serialization(),
+        restored[1].url.origin().ascii_serialization()
+    );
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn test_serde_internal_accepts_legacy_and_truncated_records() {
+    // The internal representation used to be a tuple of the serialized URL
+    // followed by the component offsets. Older records may carry fewer fields,
+    // and consumers may hand-craft these tuples; both must keep deserializing
+    // by re-parsing the serialized URL.
+    let url = Url::parse("https://user:pass@example.com:9000/path?q=1#f").unwrap();
+    let full = serde_json::to_string(&InternalRoundTrip(&url)).unwrap();
+
+    // Full, current representation.
+    let restored: Url = deserialize_internal(&full).unwrap();
+    assert_eq!(restored, url);
+
+    // A legacy record consisting of nothing but the serialized URL: every
+    // missing trailing field is tolerated instead of being filled with bogus
+    // zero offsets that point at the wrong origin/credentials.
+    let legacy = format!(r#"["{}"]"#, url.as_str());
+    let restored: Url = deserialize_internal(&legacy).unwrap();
+    assert_eq!(restored, url);
+    assert_eq!(
+        restored.origin().ascii_serialization(),
+        url.origin().ascii_serialization()
+    );
+    assert_eq!(restored.username(), url.username());
+    assert_eq!(restored.password(), url.password());
+
+    // A record with only a few of the component fields, as produced by an
+    // older crate version with fewer offsets.
+    let truncated = format!(r#"["{}", 5, 8]"#, url.as_str());
+    let restored: Url = deserialize_internal(&truncated).unwrap();
+    assert_eq!(restored, url);
+}
+
+#[cfg(feature = "serde")]
+struct InternalRoundTrip<'a>(&'a Url);
+
+#[cfg(feature = "serde")]
+impl serde::Serialize for InternalRoundTrip<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.0.serialize_internal(serializer)
+    }
+}
+
+#[cfg(feature = "serde")]
+fn deserialize_internal(json: &str) -> Result<Url, serde_json::Error> {
+    Url::deserialize_internal(serde_json::Deserializer::from_str(json))
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn test_serde_internal_canonicalizes_equivalent_offsets() {
+    // Two equivalent URLs whose stored offsets disagree (the offsets describe
+    // positions that no longer match the serialized string) must still be
+    // rebuilt into the same canonical Url instead of being trusted blindly.
+    let serialized = "https://example.com/a";
+
+    // Well-formed tuple produced by serialize_internal.
+    let good = Url::parse(serialized).unwrap();
+    let good_json = serde_json::to_string(&InternalRoundTrip(&good)).unwrap();
+
+    // Replace every component after the serialized URL string with zero values,
+    // simulating a record whose offsets were filled in by defaults rather than
+    // computed from the URL. The old implementation would happily accept this in
+    // release builds and expose different components to consumers.
+    let value: serde_json::Value = serde_json::from_str(&good_json).unwrap();
+    let mut array = value.as_array().unwrap().clone();
+    assert_eq!(array.len(), 10);
+    // Corrupt every numeric offset (indices 1..=4 and 6..=7). Keep the `host`
+    // enum (index 5) and the nullable offsets (8..=9, written as `null`) intact
+    // so the sequence still decodes, but the offsets no longer describe the
+    // serialized string. The old implementation trusted these offsets in
+    // release builds; the new one ignores them and re-parses the string.
+    for index in [1usize, 2, 3, 4, 6, 7] {
+        array[index] = serde_json::json!(0);
+    }
+    let tampered = serde_json::to_string(&array).unwrap();
+
+    let from_good: Url = deserialize_internal(&good_json).unwrap();
+    let from_tampered: Url = deserialize_internal(&tampered).unwrap();
+    assert_eq!(from_good, from_tampered);
+    assert_eq!(
+        from_tampered.origin().ascii_serialization(),
+        from_good.origin().ascii_serialization()
+    );
+    from_tampered.check_invariants().unwrap();
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn test_serde_internal_rejects_invalid_url_with_parse_error() {
+    // A record whose serialized URL cannot be parsed must fail with the same
+    // kind of error as the public Deserialize impl, never produce a Url whose
+    // origin/credentials disagree with the string it was built from.
+    let missing_url: Result<Url, _> = deserialize_internal("[]");
+    assert!(missing_url.is_err());
+
+    let invalid: Result<Url, _> = deserialize_internal(r#"["§invalid#+#*Ä"]"#);
+    let err = invalid.unwrap_err().to_string();
+    assert!(
+        err.contains("relative URL without a base"),
+        "unexpected error message: {err}"
+    );
+    assert!(err.contains("§invalid#+#*Ä"));
+}

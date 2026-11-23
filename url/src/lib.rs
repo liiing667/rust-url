@@ -2607,8 +2607,11 @@ impl Url {
 
     /// Serialize with Serde using the internal representation of the `Url` struct.
     ///
-    /// The corresponding `deserialize_internal` method sacrifices some invariant-checking
-    /// for speed, compared to the `Deserialize` trait impl.
+    /// The corresponding `deserialize_internal` method always reconstructs the URL through
+    /// the same canonical parser as [`Url::parse`], so the object it returns is guaranteed
+    /// to hold the same origin, credentials and component offsets as every other consumer
+    /// of the URL, even when the input was produced by an older version of this crate or
+    /// is missing some of the trailing fields.
     ///
     /// This method is only available if the `serde` Cargo feature is enabled.
     #[cfg(feature = "serde")]
@@ -2649,8 +2652,18 @@ impl Url {
 
     /// Serialize with Serde using the internal representation of the `Url` struct.
     ///
-    /// The corresponding `deserialize_internal` method sacrifices some invariant-checking
-    /// for speed, compared to the `Deserialize` trait impl.
+    /// Deserialization never trusts the stored component offsets directly: the serialized
+    /// URL string is fed back into the canonical URL parser, which recomputes every offset
+    /// and the `host`/`port` fields. This guarantees that
+    ///
+    /// * serialization, deserialization, canonical validation and policy consumers all
+    ///   observe the same object identity (origin and credentials included),
+    /// * records written by older crate versions keep deserializing, including tuples
+    ///   whose trailing fields are missing,
+    /// * URLs that only differ in their (equivalent) internal representation still parse
+    ///   to the same canonical `Url`, and
+    /// * malformed input is reported with the same [`ParseError`]-based error semantics
+    ///   as the `Deserialize` trait implementation instead of producing a bogus URL.
     ///
     /// This method is only available if the `serde` Cargo feature is enabled.
     #[cfg(feature = "serde")]
@@ -2659,35 +2672,79 @@ impl Url {
     where
         D: serde::Deserializer<'de>,
     {
-        use serde::de::{Deserialize, Error};
-        let (
-            serialization,
-            scheme_end,
-            username_end,
-            host_start,
-            host_end,
-            host,
-            port,
-            path_start,
-            query_start,
-            fragment_start,
-        ) = Deserialize::deserialize(deserializer)?;
-        let url = Url {
-            serialization,
-            scheme_end,
-            username_end,
-            host_start,
-            host_end,
-            host,
-            port,
-            path_start,
-            query_start,
-            fragment_start,
-        };
-        if cfg!(debug_assertions) {
-            url.check_invariants().map_err(Error::custom)?
+        use serde::de::{Deserialize, Error, SeqAccess, Visitor};
+
+        /// Legacy, permissive view of the internal tuple.
+        ///
+        /// Every field but the serialized URL string is optional so that records produced
+        /// by older crate versions (which had fewer component fields) keep deserializing.
+        /// The component offsets are intentionally ignored: the returned value always comes
+        /// from re-parsing `serialization` with the canonical URL parser.
+        struct InternalUrlRepr {
+            serialization: String,
+            scheme_end: Option<u32>,
+            username_end: Option<u32>,
+            host_start: Option<u32>,
+            host_end: Option<u32>,
+            host: Option<HostInternal>,
+            port: Option<Option<u16>>,
+            path_start: Option<u32>,
+            query_start: Option<Option<u32>>,
+            fragment_start: Option<Option<u32>>,
         }
-        Ok(url)
+
+        impl<'de> Deserialize<'de> for InternalUrlRepr {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                struct ReprVisitor;
+
+                impl<'de> Visitor<'de> for ReprVisitor {
+                    type Value = InternalUrlRepr;
+
+                    fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                        formatter.write_str(
+                            "the internal representation of a Url: a sequence starting with a URL string",
+                        )
+                    }
+
+                    fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+                    where
+                        A: SeqAccess<'de>,
+                    {
+                        // Require at least the serialized URL; every trailing component is
+                        // optional to stay compatible with records written by older crates.
+                        let serialization = seq
+                            .next_element::<String>()?
+                            .ok_or_else(|| A::Error::custom("missing serialized URL"))?;
+                        Ok(InternalUrlRepr {
+                            serialization,
+                            scheme_end: seq.next_element()?,
+                            username_end: seq.next_element()?,
+                            host_start: seq.next_element()?,
+                            host_end: seq.next_element()?,
+                            host: seq.next_element()?,
+                            port: seq.next_element()?,
+                            path_start: seq.next_element()?,
+                            query_start: seq.next_element()?,
+                            fragment_start: seq.next_element()?,
+                        })
+                    }
+                }
+
+                deserializer.deserialize_tuple(10, ReprVisitor)
+            }
+        }
+
+        let repr = InternalUrlRepr::deserialize(deserializer)?;
+
+        // Rebuild the URL from its serialized form with the canonical parser instead of
+        // trusting the deserialized offsets. This keeps origin and credentials identical
+        // for every consumer and surfaces malformed records as ordinary parse errors.
+        Url::parse(&repr.serialization).map_err(|err| {
+            Error::custom(format!("{}: {:?}", err, repr.serialization))
+        })
     }
 
     /// Assuming the URL is in the `file` scheme or similar,

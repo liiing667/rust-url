@@ -1438,3 +1438,185 @@ fn issue_1155() {
     let url = Url::parse("http://a:b@c:2\\9/").unwrap();
     assert_eq!(url.as_str(), "http://a:b@c:2/9/");
 }
+
+/// Model of a host allow-list: a policy that decides whether a URL may be
+/// fetched must see the same identity regardless of how the address is spelled.
+fn host_allow_list(url: &Url, allowed: &Host<&str>) -> bool {
+    match url.host() {
+        // Only literal, normalized IP identities are compared against an IP
+        // rule; opaque domain strings can never impersonate an allowed IP.
+        Some(host @ (Host::Ipv4(_) | Host::Ipv6(_))) => &host == allowed,
+        _ => false,
+    }
+}
+
+#[test]
+fn test_non_special_ipv4_spellings_share_one_identity() {
+    // Every spelling denotes 127.0.0.1. They must parse, normalize and
+    // serialize identically for both special and non-special schemes.
+    let spellings = [
+        "127.0.0.1",       // canonical dotted quad
+        "127.1",           // short dotted form
+        "2130706433",      // single decimal integer
+        "0x7f000001",      // single hexadecimal integer
+        "0x7f.0.0.1",      // dotted hexadecimal
+        "0177.0.0.1",      // leading-zero octal part
+        "017700000001",    // single octal integer
+        "127.0.0.1.",      // trailing dot
+    ];
+
+    let loopback = Host::Ipv4(Ipv4Addr::new(127, 0, 0, 1));
+
+    for spelling in spellings {
+        // Special scheme: this was already normalized, keep it stable.
+        let http = Url::parse(&alloc::format!("http://{spelling}/")).unwrap();
+        assert_eq!(http.host(), Some(loopback), "http://{spelling}");
+        assert_eq!(http.host_str(), Some("127.0.0.1"), "http://{spelling}");
+        assert_eq!(
+            http.as_str(),
+            "http://127.0.0.1/",
+            "http://{spelling} serialization"
+        );
+
+        // Non-special scheme: previously stored as a raw opaque string.
+        let custom = Url::parse(&alloc::format!("custom://{spelling}/")).unwrap();
+        assert_eq!(custom.host(), Some(loopback), "custom://{spelling}");
+        assert_eq!(
+            custom.host_str(),
+            Some("127.0.0.1"),
+            "custom://{spelling} host_str"
+        );
+        assert_eq!(
+            custom.as_str(),
+            "custom://127.0.0.1/",
+            "custom://{spelling} serialization"
+        );
+        // `domain()` must not report IP addresses as domains.
+        assert_eq!(custom.domain(), None);
+
+        // The policy decision is identical for every spelling and every scheme.
+        assert!(
+            host_allow_list(&http, &loopback),
+            "allow-list must accept http://{spelling}"
+        );
+        assert!(
+            host_allow_list(&custom, &loopback),
+            "allow-list must accept custom://{spelling}"
+        );
+    }
+
+    // An address that is numerically different is rejected by the same policy.
+    let other = Url::parse("custom://0x7f000002/").unwrap();
+    assert_eq!(other.host(), Some(Host::Ipv4(Ipv4Addr::new(127, 0, 0, 2))));
+    assert!(!host_allow_list(&other, &loopback));
+}
+
+#[test]
+fn test_non_special_ipv6_spellings_share_one_identity() {
+    // Brackets, upper/lower case and full vs. compressed spelling all denote ::1.
+    let spellings = [
+        "[::1]",
+        "[0:0:0:0:0:0:0:1]",
+        "[0000:0000:0000:0000:0000:0000:0000:0001]",
+        "[::0001]",
+        "[::01]",
+    ];
+    let loopback = Host::Ipv6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1));
+
+    for spelling in spellings {
+        let custom = Url::parse(&alloc::format!("custom://{spelling}/")).unwrap();
+        assert_eq!(custom.host(), Some(loopback), "custom://{spelling}");
+        assert_eq!(
+            custom.host_str(),
+            Some("[::1]"),
+            "custom://{spelling} host_str"
+        );
+        assert_eq!(
+            custom.as_str(),
+            "custom://[::1]/",
+            "custom://{spelling} serialization"
+        );
+        assert!(host_allow_list(&custom, &loopback));
+    }
+
+    // Upper-case hex spelling of a different address is normalized to lower
+    // case and cannot match an allow-list entry for another address.
+    let v6 = Url::parse("custom://[2001:DB8::1]/").unwrap();
+    assert_eq!(
+        v6.host(),
+        Some(Host::Ipv6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)))
+    );
+    assert_eq!(v6.host_str(), Some("[2001:db8::1]"));
+    assert!(!host_allow_list(&v6, &loopback));
+
+    // Malformed IPv6 literals remain hard errors.
+    assert!(Url::parse("custom://[::1").is_err());
+    assert!(Url::parse("custom://[::g]").is_err());
+
+    // Tabs and newlines are ignored by the host state before parsing, so the
+    // remaining IPv4 literal is normalized just like any other spelling.
+    let url = Url::parse("custom://2130706\t433/").unwrap();
+    assert_eq!(url.host(), Some(Host::Ipv4(Ipv4Addr::new(127, 0, 0, 1))));
+    assert_eq!(url.host_str(), Some("127.0.0.1"));
+}
+
+#[test]
+fn test_non_special_ip_normalization_through_setters() {
+    // set_host / set_hostname must converge on the same identity.
+    let mut url = Url::parse("custom://example.com/path").unwrap();
+    url.set_host(Some("0x7f000001")).unwrap();
+    assert_eq!(url.host_str(), Some("127.0.0.1"));
+    assert_eq!(url.as_str(), "custom://127.0.0.1/path");
+
+    url.set_host(Some("[0:0:0:0:0:0:0:1]")).unwrap();
+    assert_eq!(url.host_str(), Some("[::1]"));
+    assert_eq!(url.as_str(), "custom://[::1]/path");
+
+    let mut url = Url::parse("custom://example.com/").unwrap();
+    url::quirks::set_hostname(&mut url, "2130706433").unwrap();
+    assert_eq!(url.host_str(), Some("127.0.0.1"));
+    assert_eq!(url.as_str(), "custom://127.0.0.1/");
+
+    // set_ip_host keeps producing the same canonical form.
+    let mut url = Url::parse("custom://example.com/").unwrap();
+    url.set_ip_host("::1".parse().unwrap()).unwrap();
+    assert_eq!(
+        url.host(),
+        Some(Host::Ipv6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1)))
+    );
+
+    // Relative resolution inherits the canonical host identity of the base.
+    let base = Url::parse("custom://0x7f000001/dir/page").unwrap();
+    let joined = base.join("../other").unwrap();
+    assert_eq!(joined.host_str(), Some("127.0.0.1"));
+    assert_eq!(joined.as_str(), "custom://127.0.0.1/other");
+    assert_eq!(joined.host(), base.host());
+}
+
+#[test]
+fn test_non_special_plain_domains_are_not_mistaken_for_ips() {
+    // Ordinary opaque hosts keep their legacy serialization, including
+    // percent-encoding, and are never reported as IP addresses.
+    let cases = [
+        ("custom://example.com/", "example.com"),
+        ("custom://192.168.257.com/", "192.168.257.com"), // numeric-looking but a domain
+        ("custom://0x7f.0.0.0x7g/", "0x7f.0.0.0x7g"),     // invalid IPv4 radix digits
+        ("custom://foo.09../", "foo.09.."),               // invalid IPv4 structure
+        ("sc://fa%C3%9F.ExAmPlE/", "fa%C3%9F.ExAmPlE"),
+    ];
+    for (input, host) in cases {
+        let url = Url::parse(input).unwrap();
+        assert!(matches!(url.host(), Some(Host::Domain(_))), "{input}");
+        assert_eq!(url.host_str(), Some(host), "{input}");
+        assert_eq!(url.domain(), Some(host), "{input}");
+        // No domain-looking host can satisfy an IP allow-list rule.
+        assert!(!host_allow_list(
+            &url,
+            &Host::Ipv4(Ipv4Addr::new(127, 0, 0, 1))
+        ));
+    }
+
+    // Forbidden opaque host characters are still rejected.
+    assert!(Url::parse("custom://a[b/").is_err());
+    assert!(Url::parse("custom://a|b/").is_err());
+}

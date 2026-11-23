@@ -174,6 +174,42 @@ impl<'a> Host<Cow<'a, str>> {
         ))
     }
 
+    /// Host parsing for the authority of a non-special URL.
+    ///
+    /// Historically these hosts went through the *opaque host parser*, which
+    /// stores the (percent-encoded) input verbatim. That means equivalent IP
+    /// literals written in different ways (decimal integer, short dotted form,
+    /// octal or hexadecimal for IPv4; different compression or casing for IPv6)
+    /// were kept as distinct strings instead of sharing one address identity.
+    /// A host allow-list that checks the serialized host could then be bypassed
+    /// because it would only see the spelling it listed.
+    ///
+    /// To keep host parsing, IP normalization, URL serialization and any policy
+    /// built on top of `host()`/`host_str()` consistent, IP literals are parsed
+    /// with the regular host parser (exactly as for special schemes). Everything
+    /// that is not a valid IP literal keeps using the opaque host parser, so
+    /// ordinary non-special host names (including percent-encoded and otherwise
+    /// forbidden-in-domain hosts) are preserved unchanged.
+    pub(crate) fn parse_non_special_cow(input: Cow<'a, str>) -> Result<Self, ParseError> {
+        // Square brackets always denote an IPv6 literal; the opaque parser
+        // already normalizes them, so delegate straight to it.
+        if input.starts_with('[') {
+            return Self::parse_opaque_cow(input);
+        }
+
+        // Try the full host parser first. It percent-decodes, runs the
+        // ends-in-a-number check and canonicalizes every accepted IPv4/IPv6
+        // spelling into a single `Host::Ipv4`/`Host::Ipv6` identity.
+        match Self::parse_cow(input) {
+            Ok(host @ (Self::Ipv4(_) | Self::Ipv6(_))) => Ok(host),
+            // Anything that is not an IP literal (regular domains, including
+            // inputs the full parser rejects such as forbidden domain
+            // characters or percent-encoded bytes) goes through the opaque
+            // host parser, preserving the legacy byte-for-byte serialization.
+            Ok(Self::Domain(_)) | Err(_) => Self::parse_opaque_cow(input),
+        }
+    }
+
     pub(crate) fn into_owned(self) -> Host<String> {
         match self {
             Host::Domain(s) => Host::Domain(s.into_owned()),

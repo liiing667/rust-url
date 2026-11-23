@@ -1016,7 +1016,7 @@ impl Parser<'_> {
             return Err(ParseError::EmptyHost);
         }
         if !scheme_type.is_special() {
-            let host = Host::parse_opaque_cow(host_str)?;
+            let host = Host::parse_non_special_cow(host_str)?;
             return Ok((host, input));
         }
         let host = Host::parse_cow(host_str)?;

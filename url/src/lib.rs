@@ -2046,7 +2046,7 @@ impl Url {
             if SchemeType::from(self.scheme()).is_special() {
                 self.set_host_internal(Host::parse_cow(host_substr.into())?, None);
             } else {
-                self.set_host_internal(Host::parse_opaque_cow(host_substr.into())?, None);
+                self.set_host_internal(Host::parse_non_special_cow(host_substr.into())?, None);
             }
         } else if self.has_host() {
             if scheme_type.is_special() && !scheme_type.is_file() {

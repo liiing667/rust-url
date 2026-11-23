@@ -740,7 +740,11 @@ impl Parser<'_> {
                 })
             }
             Some('#') => self.fragment_only(base_url, input),
-            Some('/') | Some('\\') => {
+            Some('/') | Some('\\') if scheme_type.is_special() => {
+                // A special URL ignores any number of slashes and backslashes
+                // before the authority. Consuming the whole run here is what
+                // makes `///host`, `//\\host` and `\\\\host` resolve to the
+                // same authority as `//host`.
                 let (slashes_count, remaining) = input.count_matching(|c| matches!(c, '/' | '\\'));
                 if slashes_count >= 2 {
                     self.log_violation_if(SyntaxViolation::ExpectedDoubleSlash, || {
@@ -754,31 +758,22 @@ impl Parser<'_> {
                     debug_assert!(base_url.byte_at(scheme_end) == b':');
                     self.serialization
                         .push_str(base_url.slice(..scheme_end + 1));
-                    if let Some(after_prefix) = input.split_prefix("//") {
-                        return self.after_double_slash(after_prefix, scheme_type, scheme_end);
-                    }
                     return self.after_double_slash(remaining, scheme_type, scheme_end);
                 }
-                let path_start = base_url.path_start;
-                self.serialization.push_str(base_url.slice(..path_start));
-                self.serialization.push('/');
-                let remaining = self.parse_path(
-                    scheme_type,
-                    &mut true,
-                    path_start as usize,
-                    input_after_first_char,
-                );
-                self.with_query_and_fragment(
-                    scheme_type,
-                    base_url.scheme_end,
-                    base_url.username_end,
-                    base_url.host_start,
-                    base_url.host_end,
-                    base_url.host,
-                    base_url.port,
-                    base_url.path_start,
-                    remaining,
-                )
+                self.parse_relative_from_root(input_after_first_char, scheme_type, base_url)
+            }
+            Some('/') => {
+                // For a non-special scheme only the first two slashes are
+                // separators. Any further slashes belong to the path, and a
+                // backslash is not a separator at all.
+                if let Some(after_prefix) = input.split_prefix("//") {
+                    let scheme_end = base_url.scheme_end;
+                    debug_assert!(base_url.byte_at(scheme_end) == b':');
+                    self.serialization
+                        .push_str(base_url.slice(..scheme_end + 1));
+                    return self.after_double_slash(after_prefix, scheme_type, scheme_end);
+                }
+                self.parse_relative_from_root(input_after_first_char, scheme_type, base_url)
             }
             _ => {
                 let before_query = match (base_url.query_start, base_url.fragment_start) {
@@ -819,6 +814,32 @@ impl Parser<'_> {
                 )
             }
         }
+    }
+
+    /// Parse a relative URL that starts at the root of the base URL's path.
+    ///
+    /// `input` is the part after the leading `/` (or the special-scheme `\`).
+    fn parse_relative_from_root(
+        mut self,
+        input: Input<'_>,
+        scheme_type: SchemeType,
+        base_url: &Url,
+    ) -> ParseResult<Url> {
+        let path_start = base_url.path_start;
+        self.serialization.push_str(base_url.slice(..path_start));
+        self.serialization.push('/');
+        let remaining = self.parse_path(scheme_type, &mut true, path_start as usize, input);
+        self.with_query_and_fragment(
+            scheme_type,
+            base_url.scheme_end,
+            base_url.username_end,
+            base_url.host_start,
+            base_url.host_end,
+            base_url.host,
+            base_url.port,
+            base_url.path_start,
+            remaining,
+        )
     }
 
     fn after_double_slash(

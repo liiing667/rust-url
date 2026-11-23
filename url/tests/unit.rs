@@ -68,6 +68,125 @@ fn test_relative_empty() {
 }
 
 #[test]
+fn join_ignores_extra_special_authority_slashes() {
+    let base = Url::parse("http://example.org/a/b?base#frag").unwrap();
+    let cases = [
+        ("///test", "http://test/"),
+        (r"///\//\//test", "http://test/"),
+        ("///example.org/path", "http://example.org/path"),
+        ("///example.org/../path", "http://example.org/path"),
+        ("///example.org/../path?x=1#f", "http://example.org/path?x=1#f"),
+        (
+            "///user:pass@example.org:81/../path?x=1#f",
+            "http://user:pass@example.org:81/path?x=1#f",
+        ),
+        (r"//\example.org/../path", "http://example.org/path"),
+        (r"\///example.org/../path", "http://example.org/path"),
+    ];
+    for (input, expected) in cases {
+        let joined = base.join(input).unwrap();
+        assert_eq!(joined.as_str(), expected, "input: {input:?}");
+
+        let reparsed = Url::parse(joined.as_str()).unwrap();
+        assert_eq!(reparsed.host_str(), joined.host_str(), "input: {input:?}");
+        assert_eq!(reparsed.authority(), joined.authority(), "input: {input:?}");
+        assert_eq!(reparsed.path(), joined.path(), "input: {input:?}");
+        assert_eq!(reparsed.query(), joined.query(), "input: {input:?}");
+        assert_eq!(reparsed.fragment(), joined.fragment(), "input: {input:?}");
+        assert_eq!(reparsed.origin(), joined.origin(), "input: {input:?}");
+        joined.check_invariants().unwrap();
+    }
+
+    let joined = base.join("///example.org/../path?x=1#f").unwrap();
+    let absolute = Url::parse("http:////example.org/../path?x=1#f").unwrap();
+    assert_eq!(joined, absolute);
+}
+
+#[test]
+fn join_non_special_keeps_backslashes_in_path() {
+    let base = Url::parse("foo://example.org/a/b?base#frag").unwrap();
+    let cases = [
+        (r"\\evil.example/x", r"foo://example.org/a/\\evil.example/x"),
+        (r"\//evil.example/x", r"foo://example.org/a/\//evil.example/x"),
+        (r"\foo", r"foo://example.org/a/\foo"),
+        ("\\", "foo://example.org/a/\\"),
+        (r"/\evil.example/x", r"foo://example.org/\evil.example/x"),
+        (r"..\\..\\evil.example", r"foo://example.org/a/..\\..\\evil.example"),
+        (r"\?query", r"foo://example.org/a/\?query"),
+    ];
+    for (input, expected) in cases {
+        let joined = base.join(input).unwrap();
+        assert_eq!(joined.as_str(), expected, "input: {input:?}");
+        assert_eq!(joined.host_str(), Some("example.org"), "input: {input:?}");
+
+        let reparsed = Url::parse(joined.as_str()).unwrap();
+        assert_eq!(reparsed.host_str(), joined.host_str(), "input: {input:?}");
+        assert_eq!(reparsed.path(), joined.path(), "input: {input:?}");
+        joined.check_invariants().unwrap();
+    }
+}
+
+#[test]
+fn join_non_special_multiple_slashes_keep_root_boundary() {
+    let base = Url::parse("foo://example.org/a/b").unwrap();
+    assert_eq!(
+        base.join("//other.example/x").unwrap().as_str(),
+        "foo://other.example/x"
+    );
+    assert_eq!(
+        base.join("///other.example/x").unwrap().as_str(),
+        "foo:///other.example/x"
+    );
+    assert_eq!(
+        base.join("////other.example/x").unwrap().as_str(),
+        "foo:////other.example/x"
+    );
+    assert_eq!(
+        base.join(r"/\other.example/x").unwrap().as_str(),
+        r"foo://example.org/\other.example/x"
+    );
+
+    assert_eq!(
+        base.join("///other.example/x").unwrap(),
+        Url::parse("foo:///other.example/x").unwrap()
+    );
+    assert_eq!(
+        base.join("////other.example/x").unwrap(),
+        Url::parse("foo:////other.example/x").unwrap()
+    );
+}
+
+#[test]
+fn join_keeps_fragments_and_relative_links() {
+    let base = Url::parse("http://example.org/a/b?q#frag").unwrap();
+    assert_eq!(base.join("c").unwrap().as_str(), "http://example.org/a/c");
+    assert_eq!(base.join("../c").unwrap().as_str(), "http://example.org/c");
+    assert_eq!(
+        base.join("?x=1").unwrap().as_str(),
+        "http://example.org/a/b?x=1"
+    );
+    assert_eq!(
+        base.join("#next").unwrap().as_str(),
+        "http://example.org/a/b?q#next"
+    );
+    assert_eq!(
+        base.join(r"#//evil\next").unwrap().as_str(),
+        r"http://example.org/a/b?q#//evil\next"
+    );
+    assert_eq!(
+        base.join(r"?next=//evil\next").unwrap().as_str(),
+        r"http://example.org/a/b?next=//evil\next"
+    );
+
+    let first = base.join("///example.org/../a?x=1").unwrap();
+    assert_eq!(first.as_str(), "http://example.org/a?x=1");
+    let second = first.join("../b#next").unwrap();
+    let reparsed = Url::parse(first.as_str()).unwrap().join("../b#next").unwrap();
+    assert_eq!(second.as_str(), "http://example.org/b#next");
+    assert_eq!(second, reparsed);
+}
+
+#[test]
 fn test_strip_trailing_spaces_from_opaque_path() {
     let mut url: Url = "data:space   ?query".parse().unwrap();
     url.set_query(None);

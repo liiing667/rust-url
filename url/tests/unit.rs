@@ -122,6 +122,73 @@ fn test_set_empty_password() {
 }
 
 #[test]
+fn test_debug_does_not_leak_password() {
+    let url = Url::parse("https://user:secret123@example.com/path?query=1#frag").unwrap();
+    let debug = format!("{url:?}");
+
+    // The password itself must never appear in `Debug` output,
+    // which frequently ends up in logs.
+    assert!(
+        !debug.contains("secret123"),
+        "password leaked in debug output: {debug}"
+    );
+    // Everything else stays visible.
+    assert!(debug.contains("scheme: \"https\""), "{debug}");
+    assert!(debug.contains("username: \"user\""), "{debug}");
+    assert!(debug.contains("password: Some(\"...\")"), "{debug}");
+    assert!(debug.contains("path: \"/path\""), "{debug}");
+
+    // A URL without a password still shows `None`.
+    let url = Url::parse("https://user@example.com/").unwrap();
+    assert!(format!("{url:?}").contains("password: None"));
+
+    // An empty password is not a secret, but must not break anything.
+    let url = Url::parse("https://user:@example.com/").unwrap();
+    assert_eq!(url.password(), None);
+    assert!(format!("{url:?}").contains("password: None"));
+
+    // The serialization itself is unchanged and still round-trips.
+    let url = Url::parse("https://user:secret123@example.com/").unwrap();
+    assert_eq!(url.as_str(), "https://user:secret123@example.com/");
+    assert_eq!(url.to_string(), "https://user:secret123@example.com/");
+    assert_eq!(url.password(), Some("secret123"));
+}
+
+#[test]
+fn test_cloned_urls_keep_their_own_credentials() {
+    // Copy a URL with credentials twice, then modify each copy separately:
+    // credentials must follow their own object.
+    let original = Url::parse("ftp://user:secret@example.com/").unwrap();
+    let mut first = original.clone();
+    let mut second = original.clone();
+
+    first.set_username("alice").unwrap();
+    first.set_password(Some("alice-pass")).unwrap();
+    second.set_username("bob").unwrap();
+
+    // Changing the username of one copy must not touch the other's password,
+    // and the original is left alone.
+    assert_eq!(first.username(), "alice");
+    assert_eq!(first.password(), Some("alice-pass"));
+    assert_eq!(second.username(), "bob");
+    assert_eq!(second.password(), Some("secret"));
+    assert_eq!(original.username(), "user");
+    assert_eq!(original.password(), Some("secret"));
+
+    assert_eq!(first.as_str(), "ftp://alice:alice-pass@example.com/");
+    assert_eq!(second.as_str(), "ftp://bob:secret@example.com/");
+    assert_eq!(original.as_str(), "ftp://user:secret@example.com/");
+
+    // Debug output of each copy must not leak its own password.
+    let first_debug = format!("{first:?}");
+    let second_debug = format!("{second:?}");
+    assert!(!first_debug.contains("alice-pass"), "{first_debug}");
+    assert!(!second_debug.contains("secret"), "{second_debug}");
+    assert!(first_debug.contains("username: \"alice\""), "{first_debug}");
+    assert!(second_debug.contains("username: \"bob\""), "{second_debug}");
+}
+
+#[test]
 fn test_set_empty_hostname() {
     use url::quirks;
     let mut base: Url = "moz://foo@servo/baz".parse().unwrap();

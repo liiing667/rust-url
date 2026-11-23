@@ -2809,12 +2809,15 @@ impl From<Url> for String {
 impl fmt::Debug for Url {
     #[inline]
     fn fmt(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+        // The password is a secret: never include it in `Debug` output,
+        // which frequently ends up in logs. Only reveal whether one is set.
+        let redacted_password: Option<&str> = self.password().map(|_| "...");
         formatter
             .debug_struct("Url")
             .field("scheme", &self.scheme())
             .field("cannot_be_a_base", &self.cannot_be_a_base())
             .field("username", &self.username())
-            .field("password", &self.password())
+            .field("password", &redacted_password)
             .field("host", &self.host())
             .field("port", &self.port())
             .field("path", &self.path())

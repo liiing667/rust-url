@@ -22,7 +22,7 @@ use alloc::vec::Vec;
 use core::cell::{Cell, RefCell};
 #[cfg(feature = "std")]
 use std::dbg;
-use url::{form_urlencoded, Host, Origin, Url};
+use url::{form_urlencoded, Host, Origin, ParseError, Url};
 
 /// `std` version of `net`
 #[cfg(feature = "std")]
@@ -403,6 +403,70 @@ fn test_idna() {
     assert!("https://r2---sn-huoa-cvhl.googlevideo.com/crossdomain.xml"
         .parse::<Url>()
         .is_ok());
+}
+
+#[test]
+fn test_host_percent_decoding_is_strict() {
+    // Percent-encoded valid UTF-8 in the host is decoded and works.
+    assert_eq!(
+        Url::parse("http://m%C3%BCnchen.de/").unwrap().host_str(),
+        Some("xn--mnchen-3ya.de")
+    );
+    // Percent-encoded ASCII is decoded before the deny list is applied.
+    assert_eq!(
+        Url::parse("http://%65xample.com/").unwrap().host_str(),
+        Some("example.com")
+    );
+
+    // Percent-decoded bytes that are not well-formed UTF-8 are rejected
+    // outright: the host parser must not lossy-decode them into U+FFFD and
+    // let a rewritten, seemingly usable policy value through.
+    assert_eq!(
+        Url::parse("http://%FF.com/").unwrap_err(),
+        ParseError::IdnaError
+    );
+
+    // Interleaved good and bad encodings: a single bad label decides the
+    // final outcome, wherever it appears.
+    assert!(Url::parse("http://m%C3%BCnchen.%FF.de/").is_err());
+    assert!(Url::parse("http://%FF.m%C3%BCnchen.de/").is_err());
+
+    // A percent-encoded deny-listed character is still denied after decoding.
+    assert!(Url::parse("http://exa%25mple.com/").is_err()); // '%'
+    assert!(Url::parse("http://exa%2Fmple.com/").is_err()); // '/'
+
+    // A malformed percent sign decodes to a literal '%', which the deny list
+    // rejects as well.
+    assert!(Url::parse("http://exa%mple.com/").is_err());
+    assert!(Url::parse("http://exa%2Gmple.com/").is_err());
+}
+
+#[test]
+fn test_lossy_decode_output_is_not_a_policy_value() {
+    // The lenient consumer (form URL-encoded parsing) marks invalid UTF-8
+    // with U+FFFD instead of failing...
+    let pairs: Vec<(String, String)> =
+        form_urlencoded::parse(b"ok=%C3%BC&bad=%FF&malformed=%2G")
+            .map(|(name, value)| (name.into_owned(), value.into_owned()))
+            .collect();
+    assert_eq!(
+        pairs,
+        vec![
+            ("ok".to_string(), "ü".to_string()),
+            ("bad".to_string(), "\u{FFFD}".to_string()),
+            ("malformed".to_string(), "%2G".to_string()),
+        ]
+    );
+
+    // ...but a security policy must not be fooled by the replacement
+    // character: the marked value is rejected when used as a host.
+    let marked = &pairs[1].1;
+    assert!(marked.contains('\u{FFFD}'));
+    assert_eq!(
+        Url::parse(&format!("http://{}/", marked)).unwrap_err(),
+        ParseError::IdnaError
+    );
+    assert!(Url::parse("http://\u{FFFD}/").is_err());
 }
 
 #[test]

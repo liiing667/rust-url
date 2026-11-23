@@ -326,6 +326,12 @@ impl<'a> PercentDecode<'a> {
     ///
     /// Invalid UTF-8 percent-encoded byte sequences will be replaced � U+FFFD,
     /// the replacement character.
+    ///
+    /// Note that the presence of U+FFFD in the output is the only signal that
+    /// the input was not well-formed UTF-8. Consumers that make security
+    /// decisions based on the decoded value should use [`Self::decode_utf8`]
+    /// instead, so that malformed input is rejected rather than silently
+    /// rewritten.
     #[cfg(feature = "alloc")]
     pub fn decode_utf8_lossy(self) -> Cow<'a, str> {
         decode_utf8_lossy(self.into())
@@ -477,5 +483,46 @@ mod tests {
             super::percent_decode(b"%00%9F%92%96").decode_utf8_lossy(),
             "\u{0}���"
         );
+    }
+
+    #[test]
+    fn percent_decode_malformed_percent_sign() {
+        // A '%' that is not followed by two hexadecimal digits is passed
+        // through literally, in both strict and lossy modes.
+        assert_eq!(super::percent_decode(b"100%").decode_utf8().unwrap(), "100%");
+        assert_eq!(super::percent_decode(b"%2").decode_utf8().unwrap(), "%2");
+        assert_eq!(super::percent_decode(b"%ZZ").decode_utf8().unwrap(), "%ZZ");
+        assert_eq!(
+            super::percent_decode(b"a%2Gb").decode_utf8_lossy(),
+            "a%2Gb"
+        );
+    }
+
+    #[test]
+    fn percent_decode_strict_and_lossy_disagree_only_on_invalid_utf8() {
+        // Valid percent-encoded UTF-8 gives the same result either way.
+        assert_eq!(super::percent_decode(b"%C3%BC").decode_utf8().unwrap(), "ü");
+        assert_eq!(super::percent_decode(b"%C3%BC").decode_utf8_lossy(), "ü");
+
+        // The strict consumer rejects invalid UTF-8 outright...
+        assert!(super::percent_decode(b"%FF").decode_utf8().is_err());
+        // ...even when valid and invalid sequences are interleaved.
+        assert!(super::percent_decode(b"%C3%BC%FF%41").decode_utf8().is_err());
+
+        // The lossy consumer marks the bad bytes with U+FFFD instead of
+        // failing, so the error stays visible in the output.
+        assert_eq!(
+            super::percent_decode(b"%FF").decode_utf8_lossy(),
+            "\u{FFFD}"
+        );
+        assert_eq!(
+            super::percent_decode(b"%C3%BC%FF%41").decode_utf8_lossy(),
+            "ü\u{FFFD}A"
+        );
+
+        // A policy that refuses the replacement character cannot be fooled
+        // by lossy output into accepting a rewritten value.
+        let lossy = super::percent_decode(b"%FF%6E%63").decode_utf8_lossy();
+        assert!(lossy.contains('\u{FFFD}'));
     }
 }
